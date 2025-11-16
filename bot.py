@@ -1,46 +1,34 @@
-import asyncio
-import logging
-import os
-import sys
+import telebot
+import requests
 import tempfile
-import time
+import os
 import io
-from typing import Optional
-
-import aiohttp
-from aiogram import Bot, Dispatcher, types
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.utils import executor
-from aiogram.utils.exceptions import RetryAfter, NetworkError
+import time
+from urllib.parse import urlparse
+from threading import Thread, Lock, Semaphore
+from queue import Queue
 
 # ---------------------------
 # CONFIGURACIÓN
 # ---------------------------
-BOT_TOKEN = "8200566220:AAH4Ld6dhXYxtdsph4s7SHyH2ficT0c3SLw"  # <- pon aquí tu token
-MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB límite Telegram
-INTERNAL_MAX_FILE_SIZE = 500 * 1024 * 1024  # límite interno opcional
-DOWNLOAD_TIMEOUT = aiohttp.ClientTimeout(total=600)  # 10 min
-CHUNK_SIZE = 64 * 1024
-CONCURRENT_DOWNLOADS = 2
-PROGRESS_UPDATE_INTERVAL = 2.0  # segundos
+BOT_TOKEN = "8200566220:AAH4Ld6dhXYxtdsph4s7SHyH2ficT0c3SLw"  # <- pon tu token aquí
+bot = telebot.TeleBot(BOT_TOKEN)
+
 THUMBNAIL_URL = "https://raw.githubusercontent.com/rentcubacar40-dotcom/telegram-file-bot/main/assets/foto.jpg"
 
-# ---------------------------
-# LOGGER
-# ---------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-logger = logging.getLogger("fileprocessor")
+MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB máximo interno
+TELEGRAM_MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB máximo Telegram
+CHUNK_SIZE = 64 * 1024  # 64 KB por chunk para mayor velocidad
+DOWNLOAD_TIMEOUT = 300  # segundos
+PROGRESS_UPDATE_INTERVAL = 2.0  # segundos
 
 # ---------------------------
-# AIORGRAM GLOBALS
+# COLA DE DESCARGAS
 # ---------------------------
-bot = Bot(token=BOT_TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(bot, storage=storage)
-download_semaphore = asyncio.Semaphore(CONCURRENT_DOWNLOADS)
-last_activity = time.time()
-WATCHDOG_INTERVAL = 60
-WATCHDOG_STUCK_SECONDS = 300
+download_queue = Queue()
+queue_lock = Lock()
+semaphore = Semaphore(2)  # máximo 2 descargas simultáneas
+active_downloads = {}
 
 # ---------------------------
 # UTILIDADES
@@ -51,227 +39,169 @@ def human_size(num: int) -> str:
         num /= 1024
     return f"{num:.2f} PB"
 
-def panel_text(etapa: str, percent: float, speed: str, remaining: str, transferred: str) -> str:
-    barra = "█" * int(percent // 5) + "░" * (20 - int(percent // 5))
-    return (
-        f"🖥 **FILE PROCESSOR PRO**\n\n"
-        f"🔧 **Estado:** {etapa}\n"
-        f"📊 **Progreso:** {barra} {percent:.1f}%\n"
-        f"📁 **Transferido:** {transferred}\n"
-        f"🚀 **Velocidad:** {speed}\n"
-        f"⏱ **Restante:** {remaining}\n"
-    )
+def crear_barra_progreso(porcentaje, ancho=20):
+    completado = int(ancho * porcentaje / 100)
+    restante = ancho - completado
+    return "█" * completado + "░" * restante
 
-async def fetch_thumbnail_bytes(session: aiohttp.ClientSession) -> Optional[bytes]:
+def actualizar_progreso(chat_id, message_id, etapa, porcentaje, velocidad="", tiempo_restante="", transferido=""):
+    barra = crear_barra_progreso(porcentaje)
+    texto = f"🔄 **{etapa}**\n{barra} **{porcentaje:.1f}%**\n"
+    if velocidad:
+        texto += f"📊 **Velocidad:** {velocidad}\n"
+    if tiempo_restante:
+        texto += f"⏱️ **Tiempo restante:** {tiempo_restante}\n"
+    if transferido:
+        texto += f"📁 **Transferido:** {transferido}\n"
     try:
-        async with session.get(THUMBNAIL_URL, timeout=10) as r:
-            if r.status == 200: return await r.read()
-    except: pass
-    return None
+        bot.edit_message_text(texto, chat_id, message_id, parse_mode='Markdown')
+    except:
+        pass
+
+def obtener_miniatura():
+    try:
+        response = requests.get(THUMBNAIL_URL, timeout=10)
+        if response.status_code == 200:
+            return io.BytesIO(response.content)
+        return None
+    except:
+        return None
+
+def obtener_nombre_real(url, headers):
+    try:
+        cd = headers.get('content-disposition')
+        if cd and 'filename=' in cd:
+            filename = cd.split('filename=')[1].strip('"\' ')
+            if '.' in filename:
+                return filename
+        parsed = urlparse(url)
+        filename = os.path.basename(parsed.path)
+        if '.' in filename:
+            return filename
+        return f"archivo_{int(time.time())}.bin"
+    except:
+        return f"archivo_{int(time.time())}.bin"
 
 # ---------------------------
-# WATCHDOG
+# DESCARGA Y SUBIDA CON PROGRESO
 # ---------------------------
-async def watchdog_loop():
-    global last_activity
-    while True:
-        await asyncio.sleep(WATCHDOG_INTERVAL)
-        idle = time.time() - last_activity
-        if idle > WATCHDOG_STUCK_SECONDS:
-            logger.critical(f"Watchdog detectó inactividad ({idle:.0f}s). Reiniciando...")
-            try: await bot.close()
+def descargar_y_enviar(chat_id, source_url=None, file_id=None, file_name=None):
+    temp_path = None
+    progress_msg = bot.send_message(chat_id, "🔄 Preparando descarga...", parse_mode='Markdown')
+    try:
+        # 1️⃣ Preparar URL o Telegram file
+        if file_id:  # archivo de Telegram
+            file_info = bot.get_file(file_id)
+            source_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info.file_path}"
+            if not file_name:
+                file_name = file_info.file_path.split('/')[-1]
+
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        head = requests.head(source_url, headers=headers, timeout=10, allow_redirects=True)
+        total_size = int(head.headers.get('content-length', 0))
+        if total_size > MAX_FILE_SIZE:
+            raise Exception(f"Archivo demasiado grande ({human_size(total_size)})")
+
+        file_name = file_name or obtener_nombre_real(source_url, head.headers)
+
+        # 2️⃣ Descargar con progreso
+        response = requests.get(source_url, headers=headers, stream=True, timeout=DOWNLOAD_TIMEOUT)
+        response.raise_for_status()
+        temp_path = tempfile.mktemp(suffix=os.path.splitext(file_name)[1])
+        downloaded = 0
+        start_time = time.time()
+        last_update = 0
+
+        for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+            if chunk:
+                with semaphore:  # limitar descargas simultáneas
+                    with open(temp_path, 'ab') as f:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        # Calcular progreso
+                        elapsed = time.time() - start_time
+                        speed = downloaded / elapsed if elapsed > 0 else 0
+                        speed_txt = f"{human_size(speed)}/s"
+                        percent = (downloaded / total_size) * 100 if total_size else 0
+                        remaining = (total_size - downloaded) / speed if speed > 0 else 0
+                        remaining_txt = f"{int(remaining)}s" if remaining < 60 else f"{remaining/60:.1f}m"
+                        transferred = f"{human_size(downloaded)}/{human_size(total_size)}" if total_size else human_size(downloaded)
+                        now = time.time()
+                        if now - last_update > PROGRESS_UPDATE_INTERVAL:
+                            last_update = now
+                            actualizar_progreso(chat_id, progress_msg.message_id, "📥 DESCARGANDO", percent, speed_txt, remaining_txt, transferred)
+
+        # 3️⃣ Subida con progreso
+        uploaded = 0
+        start_upload = time.time()
+        class ProgressFile(io.BufferedReader):
+            def read(self, n=-1):
+                nonlocal uploaded
+                chunk = super().read(n)
+                if chunk:
+                    uploaded += len(chunk)
+                    elapsed = time.time() - start_upload
+                    speed = uploaded / elapsed if elapsed>0 else 0
+                    speed_txt = f"{human_size(speed)}/s"
+                    percent = (uploaded / downloaded) * 100 if downloaded else 0
+                    remaining = (downloaded - uploaded)/speed if speed>0 else 0
+                    remaining_txt = f"{int(remaining)}s" if remaining<60 else f"{remaining/60:.1f}m"
+                    actualizar_progreso(chat_id, progress_msg.message_id, "📤 SUBIENDO", percent, speed_txt, remaining_txt, f"{human_size(uploaded)}/{human_size(downloaded)}")
+                return chunk
+
+        thumb = obtener_miniatura()
+        with ProgressFile(open(temp_path,'rb')) as f:
+            bot.send_document(chat_id, f, visible_file_name=file_name, caption=f"`{file_name}`", parse_mode='Markdown', thumb=thumb)
+
+        bot.delete_message(chat_id, progress_msg.message_id)
+        bot.send_message(chat_id, f"✅ Proceso completado: `{file_name}`", parse_mode='Markdown')
+
+    except Exception as e:
+        bot.edit_message_text(f"❌ Error: `{str(e)}`", chat_id, progress_msg.message_id, parse_mode='Markdown')
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try: os.unlink(temp_path)
             except: pass
-            os.execv(sys.executable, [sys.executable] + sys.argv)
-
-# ---------------------------
-# DESCARGA ASÍNCRONA
-# ---------------------------
-async def async_download_with_progress(url: str, chat_id: int, panel_msg_id: int, session: aiohttp.ClientSession):
-    global last_activity
-    for attempt in range(1,5):
-        try:
-            async with download_semaphore:
-                async with session.head(url, timeout=DOWNLOAD_TIMEOUT, allow_redirects=True) as head:
-                    total = int(head.headers.get("content-length") or 0)
-                    filename = head.headers.get("content-disposition")
-                    if filename and "filename=" in filename: filename = filename.split("filename=")[1].strip('"\' ')
-                    else: filename = os.path.basename(url.split("?")[0]) or f"archivo_{int(time.time())}.bin"
-
-                if total and total > MAX_FILE_SIZE:
-                    raise Exception(f"Archivo demasiado grande ({human_size(total)}). Límite: {human_size(MAX_FILE_SIZE)}")
-
-                async with session.get(url, timeout=DOWNLOAD_TIMEOUT) as resp:
-                    resp.raise_for_status()
-                    fd, tmp_path = tempfile.mkstemp(suffix=os.path.splitext(filename)[1])
-                    os.close(fd)
-                    downloaded = 0
-                    start = time.time()
-                    last_update = 0
-                    with open(tmp_path,"wb") as f:
-                        async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
-                            if not chunk: continue
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            last_activity = time.time()
-                            if downloaded > INTERNAL_MAX_FILE_SIZE and INTERNAL_MAX_FILE_SIZE < MAX_FILE_SIZE:
-                                logger.warning("Se excedió INTERNAL_MAX_FILE_SIZE")
-
-                            elapsed = time.time() - start
-                            speed = downloaded/elapsed if elapsed>0 else 0
-                            speed_txt = human_size(speed) + "/s"
-                            percent = (downloaded/total*100) if total else 0.0
-                            remaining = ((total - downloaded)/speed) if (speed>0 and total) else None
-                            remaining_txt = f"{remaining:.0f}s" if remaining and remaining<60 else (f"{remaining/60:.1f}m" if remaining else "Calculando...")
-                            transferred_txt = f"{human_size(downloaded)}" + (f"/{human_size(total)}" if total else "")
-                            now=time.time()
-                            if now-last_update>PROGRESS_UPDATE_INTERVAL or percent>=100:
-                                last_update=now
-                                try:
-                                    await bot.edit_message_text(chat_id=chat_id,message_id=panel_msg_id,text=panel_text("DESCARGANDO",percent,speed_txt,remaining_txt,transferred_txt),parse_mode="Markdown")
-                                except: pass
-                    return tmp_path, filename
-        except Exception as e:
-            if attempt<4:
-                await asyncio.sleep(2**attempt)
-                continue
-            raise e
-
-# ---------------------------
-# ENVÍO DE ARCHIVO
-# ---------------------------
-async def send_document_with_thumb(chat_id:int,file_path:str,filename:str,thumb_bytes:Optional[bytes]=None):
-    attempts=4
-    backoff=2
-    for i in range(attempts):
-        try:
-            with open(file_path,"rb") as f:
-                await bot.send_document(chat_id, types.InputFile(f, filename=filename), caption=f"`{filename}`", parse_mode="Markdown")
-                return True
-        except RetryAfter as e:
-            await asyncio.sleep(e.timeout+1)
-        except Exception:
-            await asyncio.sleep(backoff**i)
-            continue
-    raise Exception("No se pudo enviar el archivo")
 
 # ---------------------------
 # HANDLERS
 # ---------------------------
-@dp.message_handler(commands=["start"])
-async def cmd_start(message: types.Message):
-    global last_activity
-    last_activity=time.time()
-    await message.reply("🤖 **File Processor Pro (Aiogram)**\nEnvía un archivo o enlace y lo procesaré.\nUsa /ayuda.",parse_mode="Markdown")
+@bot.message_handler(commands=['start'])
+def start_command(message):
+    bot.send_message(message.chat.id, "🤖 **File Processor Pro**\nEnvía un archivo o un enlace para procesarlo.\nUsa /ayuda para más información.", parse_mode='Markdown')
 
-@dp.message_handler(commands=["ayuda"])
-async def cmd_ayuda(message: types.Message):
-    global last_activity
-    last_activity=time.time()
-    await message.reply("📘 **AYUDA**\n• Envía archivos (document, photo, video, audio) o enlaces (http/https).\n• Límite Telegram: 2GB\n• Interno: 500MB\nComandos: /start /ayuda /estado",parse_mode="Markdown")
+@bot.message_handler(commands=['ayuda'])
+def ayuda_command(message):
+    bot.send_message(message.chat.id, "📘 **AYUDA**\n• Envía archivos (document, photo, video, audio) o enlaces (http/https).\n• Tamaño máximo: 500MB\n• Comandos: /start /ayuda /estado /queue /cancel", parse_mode='Markdown')
 
-@dp.message_handler(commands=["estado"])
-async def cmd_estado(message: types.Message):
-    global last_activity
-    last_activity=time.time()
-    await message.reply("🟢 Sistema operativo y estable",parse_mode="Markdown")
+@bot.message_handler(commands=['estado'])
+def estado_command(message):
+    bot.send_message(message.chat.id, "🟢 Sistema operativo y estable", parse_mode='Markdown')
 
-# ---------------------------
-# ARCHIVOS DIRECTOS
-# ---------------------------
-@dp.message_handler(content_types=[types.ContentType.DOCUMENT, types.ContentType.PHOTO, types.ContentType.VIDEO, types.ContentType.AUDIO])
-async def handle_file(message: types.Message):
-    global last_activity
-    last_activity=time.time()
-    chat_id = message.chat.id
+# Archivos directos
+@bot.message_handler(content_types=['document','photo','video','audio'])
+def handle_file(message):
+    Thread(target=descargar_y_enviar, args=(message.chat.id, None, getattr(message.document,'file_id', None) or getattr(message.photo[-1],'file_id', None), getattr(message.document,'file_name', None))).start()
 
-    # Obtener información del archivo
-    if message.document:
-        file_id = message.document.file_id
-        filename = message.document.file_name or f"file_{int(time.time())}.bin"
-        file_size = message.document.file_size or 0
-    elif message.photo:
-        file_id = message.photo[-1].file_id
-        filename = f"photo_{int(time.time())}.jpg"
-        file_size = 0
-    elif message.video:
-        file_id = message.video.file_id
-        filename = f"video_{int(time.time())}.mp4"
-        file_size = message.video.file_size or 0
-    elif message.audio:
-        file_id = message.audio.file_id
-        filename = message.audio.file_name or f"audio_{int(time.time())}.mp3"
-        file_size = message.audio.file_size or 0
-    else:
-        return
+# Enlaces
+@bot.message_handler(func=lambda m: m.text and m.text.startswith(('http://','https://')))
+def handle_url(message):
+    Thread(target=descargar_y_enviar, args=(message.chat.id, message.text.strip())).start()
 
-    if file_size>MAX_FILE_SIZE:
-        await message.reply(f"❌ Archivo demasiado grande: {human_size(file_size)}",parse_mode="Markdown")
-        return
-
-    panel = await message.reply("🔄 Preparando descarga desde Telegram...",parse_mode="Markdown")
-    try:
-        file_info = await bot.get_file(file_id)
-        file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info.file_path}"
-        async with aiohttp.ClientSession(timeout=DOWNLOAD_TIMEOUT) as session:
-            tmp_path, fname = await async_download_with_progress(file_url, chat_id, panel.message_id, session)
-            thumb_bytes = await fetch_thumbnail_bytes(session)
-            await send_document_with_thumb(chat_id, tmp_path, filename, thumb_bytes)
-            await bot.delete_message(chat_id, panel.message_id)
-            await message.reply(f"✅ Proceso completado: `{filename}`",parse_mode="Markdown")
-    finally:
-        try: os.unlink(tmp_path)
-        except: pass
-        last_activity=time.time()
+# Fallback
+@bot.message_handler(func=lambda m: True)
+def fallback(message):
+    bot.reply_to(message, "Envía un archivo o enlace (http/https). Usa /ayuda para más detalles.", parse_mode='Markdown')
 
 # ---------------------------
-# MENSAJES CON URL
-# ---------------------------
-@dp.message_handler(lambda msg: msg.text and msg.text.lower().startswith(("http://","https://")))
-async def handle_url(message: types.Message):
-    global last_activity
-    last_activity=time.time()
-    url = message.text.strip()
-    chat_id = message.chat.id
-    panel = await message.reply("🔎 Analizando enlace...",parse_mode="Markdown")
-    try:
-        async with aiohttp.ClientSession(timeout=DOWNLOAD_TIMEOUT) as session:
-            tmp_path, filename = await async_download_with_progress(url, chat_id, panel.message_id, session)
-            thumb_bytes = await fetch_thumbnail_bytes(session)
-            await send_document_with_thumb(chat_id, tmp_path, filename, thumb_bytes)
-            await bot.delete_message(chat_id, panel.message_id)
-            await message.reply(f"✅ Descarga completada: `{filename}`",parse_mode="Markdown")
-    finally:
-        try: os.unlink(tmp_path)
-        except: pass
-        last_activity=time.time()
-
-# ---------------------------
-# MENSAJES FALLBACK
-# ---------------------------
-@dp.message_handler()
-async def fallback(message: types.Message):
-    await message.reply("Envía un archivo o enlace (http/https). Usa /ayuda para más detalles.",parse_mode="Markdown")
-
-# ---------------------------
-# STARTUP / SHUTDOWN
-# ---------------------------
-async def on_startup(dp: Dispatcher):
-    logger.info("Iniciando File Processor Pro (Aiogram)")
-    asyncio.create_task(watchdog_loop())
-
-async def on_shutdown(dp: Dispatcher):
-    logger.info("Cerrando bot...")
-    await bot.close()
-
-# ---------------------------
-# EJECUCIÓN RESILIENTE
+# BUCLE PRINCIPAL
 # ---------------------------
 def main():
     while True:
         try:
-            executor.start_polling(dp, skip_updates=True, on_startup=on_startup, on_shutdown=on_shutdown)
+            bot.infinity_polling(timeout=60, long_polling_timeout=30)
         except Exception as e:
-            logger.exception(f"Loop falló: {e} - reiniciando en 5s")
+            print(f"Error crítico: {e}. Reiniciando en 5s...")
             time.sleep(5)
 
 if __name__=="__main__":
