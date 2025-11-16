@@ -10,7 +10,7 @@ from zipfile import ZipFile
 # -------------------------
 # CONFIGURACIÓN
 # -------------------------
-BOT_TOKEN = "TU_TOKEN_AQUI"  # <- coloca tu token aquí
+BOT_TOKEN = "8200566220:AAH4Ld6dhXYxtdsph4s7SHyH2ficT0c3SLw"  # <- coloca tu token aquí
 bot = telebot.TeleBot(BOT_TOKEN)
 
 THUMBNAIL_URL = "https://raw.githubusercontent.com/rentcubacar40-dotcom/telegram-file-bot/main/assets/foto.jpg"
