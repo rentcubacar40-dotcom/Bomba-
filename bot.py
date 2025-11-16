@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 BOT_TOKEN = "8200566220:AAH4Ld6dhXYxtdsph4s7SHyH2ficT0c3SLw"
 bot = telebot.TeleBot(BOT_TOKEN)
 
-THUMBNAIL_URL = "https://raw.githubusercontent.com/TU_USUARIO/telegram-file-bot/main/assets/thumbnail.jpg"
+THUMBNAIL_URL = "https://raw.githubusercontent.com/rentcubacar40-dotcom/telegram-file-bot/main/assets/foto.jpg"
 
 def obtener_miniatura():
     try:
