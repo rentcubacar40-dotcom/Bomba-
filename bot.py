@@ -16,7 +16,7 @@ from aiogram.utils.exceptions import RetryAfter, NetworkError
 # ---------------------------
 # CONFIGURACIÓN
 # ---------------------------
-BOT_TOKEN = "TU_TOKEN_AQUI"  # <- pon aquí tu token
+BOT_TOKEN = "8200566220:AAH4Ld6dhXYxtdsph4s7SHyH2ficT0c3SLw"  # <- pon aquí tu token
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB límite Telegram
 INTERNAL_MAX_FILE_SIZE = 500 * 1024 * 1024  # límite interno opcional
 DOWNLOAD_TIMEOUT = aiohttp.ClientTimeout(total=600)  # 10 min
