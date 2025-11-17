@@ -4,210 +4,337 @@ import tempfile
 import os
 import io
 import time
+import zipfile
 from urllib.parse import urlparse
-from zipfile import ZipFile
+from datetime import datetime
+from PIL import Image
+from telebot.types import InputFile
 
-# -------------------------
-# CONFIGURACIÓN
-# -------------------------
-BOT_TOKEN = "8200566220:AAH4Ld6dhXYxtdsph4s7SHyH2ficT0c3SLw"  # <- coloca tu token aquí
+BOT_TOKEN = "TU_TOKEN_AQUI"  # Coloca tu token real aquí
 bot = telebot.TeleBot(BOT_TOKEN)
 
-THUMBNAIL_URL = "https://raw.githubusercontent.com/rentcubacar40-dotcom/telegram-file-bot/main/assets/foto.jpg"
+THUMBNAIL_URL = "https://raw.githubusercontent.com/rentcubacar40-dotcom/Bomba-/refs/heads/main/assets/foto.jpg"
 
-MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB
-CHUNK_SIZE = 64 * 1024  # 64 KB
-DOWNLOAD_TIMEOUT = 300
-PROGRESS_INTERVAL = 5  # segundos entre actualizaciones
+MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB máximo
+DOWNLOAD_TIMEOUT = 300  # 5 minutos máximo
+CHUNK_SIZE = 8192
 
 # -------------------------
-# UTILIDADES
+# FUNCIONES AUXILIARES
 # -------------------------
-def human_size(num: int) -> str:
-    for unit in ["B","KB","MB","GB"]:
-        if num < 1024: return f"{num:.2f} {unit}"
-        num /= 1024
-    return f"{num:.2f} TB"
+
+def human_size(bytes_size):
+    if bytes_size < 1024:
+        return f"{bytes_size} B"
+    elif bytes_size < 1024**2:
+        return f"{bytes_size/1024:.1f} KB"
+    elif bytes_size < 1024**3:
+        return f"{bytes_size/1024/1024:.1f} MB"
+    else:
+        return f"{bytes_size/1024/1024/1024:.1f} GB"
 
 def crear_barra_progreso(porcentaje, ancho=20):
     completado = int(ancho * porcentaje / 100)
     restante = ancho - completado
     return "█" * completado + "░" * restante
 
-def actualizar_progreso(chat_id, message_id, etapa, porcentaje, velocidad="", tiempo_restante="", transferido=""):
+def actualizar_progreso(chat_id, message_id, etapa, porcentaje, velocidad="", transferido=""):
     barra = crear_barra_progreso(porcentaje)
-    texto = f"🔄 **{etapa}**\n{barra} **{porcentaje:.1f}%**\n"
+    texto = f"🔄 **{etapa}**\n{barra} **{porcentaje:.1f}%**"
     if velocidad:
-        texto += f"📊 **Velocidad:** {velocidad}\n"
-    if tiempo_restante:
-        texto += f"⏱️ **Tiempo restante:** {tiempo_restante}\n"
+        texto += f"\n📊 **Velocidad:** {velocidad}"
     if transferido:
-        texto += f"📁 **Transferido:** {transferido}\n"
+        texto += f"\n💾 **Transferido:** {transferido}"
     try:
         bot.edit_message_text(texto, chat_id, message_id, parse_mode='Markdown')
-    except:
+    except Exception:
         pass
 
-def obtener_miniatura():
-    try:
-        response = requests.get(THUMBNAIL_URL, timeout=10)
-        if response.status_code == 200:
-            return io.BytesIO(response.content)
-        return None
-    except:
-        return None
+# -------------------------
+# MINIATURA FUNCIONAL (ARREGLADO)
+# -------------------------
 
-def obtener_nombre_real(url, headers):
-    cd = headers.get('content-disposition')
-    if cd and 'filename=' in cd:
-        filename = cd.split('filename=')[1].strip('"\' ')
-        if '.' in filename:
-            return filename
-    parsed = urlparse(url)
-    filename = os.path.basename(parsed.path)
-    if '.' in filename:
-        return filename
-    return f"archivo_{int(time.time())}.bin"
+def obtener_miniatura():
+    """Descarga la miniatura RAW, la procesa y la convierte a InputFile."""
+    try:
+        resp = requests.get(THUMBNAIL_URL, timeout=10)
+        if resp.status_code == 200:
+            img = Image.open(io.BytesIO(resp.content))
+            img.thumbnail((320, 320))
+            buff = io.BytesIO()
+            img.save(buff, format="JPEG")
+            buff.seek(0)
+            return InputFile(buff, filename="thumbnail.jpg")
+    except Exception as e:
+        print("Error miniatura:", e)
+    return None
+
+# -------------------------
+# DETECTAR ARCHIVOS PELIGROSOS
+# -------------------------
 
 def comprimir_archivo_si_peligroso(file_path):
-    """Comprime archivos peligrosos como .apk, .exe, .ipa"""
     ext = os.path.splitext(file_path)[1].lower()
-    if ext in ['.apk', '.exe', '.ipa', '.bat', '.jar']:
+    peligrosas = ['.apk', '.ipa', '.exe', '.bat', '.jar']
+
+    if ext in peligrosas:
         zip_path = tempfile.mktemp(suffix=".zip")
-        with ZipFile(zip_path,'w') as zipf:
-            zipf.write(file_path, arcname=os.path.basename(file_path))
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+            z.write(file_path, arcname=os.path.basename(file_path))
         return zip_path, True
+
     return file_path, False
 
 # -------------------------
-# ENVÍO CON PROGRESO REAL
+# NOMBRE REAL DEL ARCHIVO DESDE HEADERS
 # -------------------------
-def send_document_con_progreso(chat_id, file_path, filename, thumb=None):
-    file_size = os.path.getsize(file_path)
-    start_time = time.time()
-    uploaded_bytes = 0
 
-    # Wrapper personalizado usando un stream
-    class FileWrapper(io.BufferedReader):
-        def read(self, n=-1):
-            nonlocal uploaded_bytes
-            chunk = super().read(n)
-            if chunk:
-                uploaded_bytes += len(chunk)
-                elapsed = time.time() - start_time
-                velocidad = human_size(uploaded_bytes/(elapsed+0.01))+"/s"
-                percent = uploaded_bytes/file_size*100
-                actualizar_progreso(chat_id, progress_msg.message_id, "📤 SUBIENDO", percent, velocidad, transferido=f"{human_size(uploaded_bytes)}/{human_size(file_size)}")
-            return chunk
-
-    with open(file_path,'rb') as f:
-        wrapped = FileWrapper(f)
-        bot.send_document(chat_id, wrapped, visible_file_name=filename, caption=f"`{filename}`", parse_mode='Markdown', thumb=thumb)
-
-# -------------------------
-# DESCARGA Y ENVÍO
-# -------------------------
-def descargar_y_enviar(chat_id, url=None, file_id=None, filename=None):
-    global progress_msg
-    temp_path = None
-    progress_msg = bot.send_message(chat_id, "🔄 Preparando descarga...", parse_mode='Markdown')
+def obtener_nombre_real(url, headers):
     try:
-        if file_id:
-            info = bot.get_file(file_id)
-            url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{info.file_path}"
-            if not filename:
-                filename = info.file_path.split('/')[-1]
+        if 'content-disposition' in headers:
+            cd = headers['content-disposition']
+            if 'filename=' in cd:
+                filename = cd.split('filename=')[1].strip('"\'')
+                if "." in filename:
+                    return filename
 
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        head = requests.head(url, headers=headers, timeout=10, allow_redirects=True)
-        total_size = int(head.headers.get('content-length', 0))
-        if total_size > MAX_FILE_SIZE:
-            raise Exception(f"Archivo demasiado grande ({human_size(total_size)})")
+        parsed = urlparse(url)
+        base = parsed.path.split("/")[-1]
+        if "." in base:
+            return base
 
-        filename = filename or obtener_nombre_real(url, head.headers)
+        return f"archivo_{int(time.time())}.bin"
 
-        # Descarga con progreso
-        response = requests.get(url, headers=headers, stream=True, timeout=DOWNLOAD_TIMEOUT)
-        response.raise_for_status()
+    except:
+        return f"archivo_{int(time.time())}.bin"
+
+# -------------------------
+# DESCARGA CON PROGRESO
+# -------------------------
+
+def descargar_con_progreso(url, chat_id, progress_msg):
+    temp_path = None
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+
+        head = requests.head(url, headers=headers, allow_redirects=True, timeout=10)
+        total = int(head.headers.get("content-length", 0))
+
+        if total > MAX_FILE_SIZE:
+            raise Exception(f"Archivo demasiado grande ({human_size(total)})")
+
+        filename = obtener_nombre_real(url, head.headers)
+
+        resp = requests.get(url, headers=headers, stream=True, timeout=DOWNLOAD_TIMEOUT)
+        resp.raise_for_status()
+
         temp_path = tempfile.mktemp(suffix=os.path.splitext(filename)[1])
         downloaded = 0
-        start_time = time.time()
-        last_update = 0
+        start = time.time()
 
-        with open(temp_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+        with open(temp_path, "wb") as f:
+            for chunk in resp.iter_content(CHUNK_SIZE):
                 if chunk:
                     f.write(chunk)
                     downloaded += len(chunk)
-                    elapsed = time.time() - start_time
-                    speed = downloaded/elapsed if elapsed>0 else 0
-                    percent = downloaded/total_size*100 if total_size else 0
-                    remaining = (total_size-downloaded)/speed if speed>0 else 0
-                    now = time.time()
-                    if now - last_update > PROGRESS_INTERVAL:
-                        last_update = now
-                        actualizar_progreso(chat_id, progress_msg.message_id, "📥 DESCARGANDO", percent, f"{human_size(speed)}/s", f"{int(remaining)}s" if remaining<60 else f"{remaining/60:.1f}m", f"{human_size(downloaded)}/{human_size(total_size)}")
+                    if total > 0:
+                        elapsed = time.time() - start
+                        speed = downloaded / elapsed
+                        percent = downloaded / total * 100
+                        actualizar_progreso(
+                            chat_id,
+                            progress_msg.message_id,
+                            "📥 DESCARGANDO ARCHIVO",
+                            percent,
+                            f"{human_size(speed)}/s",
+                            f"{human_size(downloaded)}/{human_size(total)}"
+                        )
 
-        # Comprimir si necesario
-        final_path, comprimido = comprimir_archivo_si_peligroso(temp_path)
-        if comprimido:
-            bot.send_message(chat_id, "⚠️ Archivo peligroso detectado. Se ha comprimido a `.zip` para poder enviarlo.", parse_mode='Markdown')
-            filename = os.path.basename(final_path)
-
-        # Enviar con progreso real
-        thumb = obtener_miniatura()
-        send_document_con_progreso(chat_id, final_path, filename, thumb)
-
-        bot.delete_message(chat_id, progress_msg.message_id)
-        bot.send_message(chat_id, f"✅ Proceso completado: `{filename}`", parse_mode='Markdown')
+        return temp_path, filename
 
     except Exception as e:
-        bot.edit_message_text(f"❌ Error: `{str(e)}`", chat_id, progress_msg.message_id, parse_mode='Markdown')
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
+        raise e
+
+# -------------------------
+# SUBIDA CON PROGRESO
+# -------------------------
+
+def send_document_con_progreso(chat_id, file_path, filename):
+    file_size = os.path.getsize(file_path)
+    start = time.time()
+    uploaded = 0
+
+    thumb = obtener_miniatura()
+
+    class Wrapper(io.BufferedReader):
+        def read(self, n=-1):
+            nonlocal uploaded
+            chunk = super().read(n)
+            if chunk:
+                uploaded += len(chunk)
+                percent = uploaded / file_size * 100
+                elapsed = time.time() - start
+                velocidad = human_size(uploaded/(elapsed+0.01)) + "/s"
+                actualizar_progreso(
+                    chat_id,
+                    progress_msg.message_id,
+                    "📤 SUBIENDO",
+                    percent,
+                    velocidad,
+                    f"{human_size(uploaded)}/{human_size(file_size)}"
+                )
+            return chunk
+
+    final_path, comprimido = comprimir_archivo_si_peligroso(file_path)
+    if comprimido:
+        filename = os.path.basename(final_path)
+        bot.send_message(chat_id, "⚠️ Archivo peligroso detectado. Se comprimió a .zip", parse_mode='Markdown')
+
+    with open(final_path, "rb") as original:
+        wrapped = Wrapper(original)
+        bot.send_document(
+            chat_id,
+            wrapped,
+            visible_file_name=filename,
+            caption=f"`{filename}`",
+            parse_mode="Markdown",
+            thumb=thumb
+        )
+
+# -------------------------
+# COMANDOS /start y /help
+# -------------------------
+
+@bot.message_handler(commands=["start", "help"])
+def start_message(message):
+    bot.send_message(
+        message.chat.id,
+        """
+🤖 **File Processor Pro**
+
+Envíame:
+• Archivos
+• Fotos
+• Audios
+• Videos
+• Enlaces directos
+
+Funciones:
+✔ Progreso de descarga
+✔ Progreso de subida
+✔ Miniaturas personalizadas
+✔ Apps peligrosas se comprimen a ZIP
+✔ Mantiene extensión original de enlaces
+
+⚠️ Tamaños máximos:
+• Archivos enviados directo: máx 50MB (por Telegram)
+• Enlaces externos: hasta 500MB
+        """,
+        parse_mode="Markdown"
+    )
+
+# -------------------------
+# ARCHIVOS ENVIADOS DESDE TELEGRAM
+# -------------------------
+
+@bot.message_handler(content_types=["document", "photo", "video", "audio"])
+def handle_files(message):
+    global progress_msg
+    temp_path = None
+    try:
+        if message.document:
+            file_id = message.document.file_id
+            filename = message.document.file_name
+            file_size = message.document.file_size
+        elif message.photo:
+            file_id = message.photo[-1].file_id
+            filename = f"foto_{int(time.time())}.jpg"
+            file_size = 0
+        elif message.video:
+            file_id = message.video.file_id
+            filename = f"video_{int(time.time())}.mp4"
+            file_size = message.video.file_size
+        elif message.audio:
+            file_id = message.audio.file_id
+            filename = message.audio.file_name
+            file_size = message.audio.file_size
+
+        progress_msg = bot.reply_to(message, "🔄 Preparando...", parse_mode="Markdown")
+
+        file_info = bot.get_file(file_id)
+        url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info.file_path}"
+
+        temp_path = tempfile.mktemp(suffix=os.path.splitext(filename)[1])
+        downloaded = 0
+        start = time.time()
+
+        resp = requests.get(url, stream=True)
+        with open(temp_path, "wb") as f:
+            for chunk in resp.iter_content(CHUNK_SIZE):
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if file_size > 0:
+                        elapsed = time.time() - start
+                        velocidad = human_size(downloaded/(elapsed+0.01)) + "/s"
+                        percent = downloaded / file_size * 100
+                        actualizar_progreso(
+                            message.chat.id,
+                            progress_msg.message_id,
+                            "📥 DESCARGANDO DE TELEGRAM",
+                            percent,
+                            velocidad,
+                            f"{human_size(downloaded)}/{human_size(file_size)}"
+                        )
+
+        send_document_con_progreso(message.chat.id, temp_path, filename)
+        bot.delete_message(message.chat.id, progress_msg.message_id)
+        bot.reply_to(message, f"✅ Listo: `{filename}`", parse_mode="Markdown")
+
+    except Exception as e:
+        bot.edit_message_text(f"❌ Error: `{str(e)}`", message.chat.id, progress_msg.message_id, parse_mode="Markdown")
     finally:
         if temp_path and os.path.exists(temp_path):
-            try: os.unlink(temp_path)
-            except: pass
+            os.unlink(temp_path)
 
 # -------------------------
-# HANDLERS
+# ENLACES
 # -------------------------
-@bot.message_handler(commands=['start'])
-def start(message):
-    bot.send_message(message.chat.id, "🤖 **File Processor Pro**\nEnvía un archivo o enlace para procesarlo.\nUsa /ayuda para más información.", parse_mode='Markdown')
-
-@bot.message_handler(commands=['ayuda'])
-def ayuda(message):
-    bot.send_message(message.chat.id, "📘 **AYUDA**\n• Envía archivos o enlaces (http/https)\n• Tamaño máximo: 500MB\n• Archivos peligrosos (.apk, .exe, .ipa) se enviarán como .zip\n• Soporta documentos, fotos, videos y audio", parse_mode='Markdown')
-
-@bot.message_handler(content_types=['document','photo','video','audio'])
-def handle_file(message):
-    file_id = None
-    filename = None
-    if message.document:
-        file_id = message.document.file_id
-        filename = message.document.file_name
-    elif message.photo:
-        file_id = message.photo[-1].file_id
-        filename = f"image_{int(time.time())}.jpg"
-    elif message.video:
-        file_id = message.video.file_id
-        filename = f"video_{int(time.time())}.mp4"
-    elif message.audio:
-        file_id = message.audio.file_id
-        filename = message.audio.file_name
-    descargar_y_enviar(message.chat.id, file_id=file_id, filename=filename)
-
-@bot.message_handler(func=lambda m: m.text and m.text.startswith(('http://','https://')))
-def handle_url(message):
-    descargar_y_enviar(message.chat.id, url=message.text.strip())
 
 @bot.message_handler(func=lambda m: True)
-def fallback(message):
-    bot.reply_to(message, "Envía un archivo o enlace válido (http/https). Usa /ayuda para más información.", parse_mode='Markdown')
+def handle_url(message):
+    global progress_msg
+    url = message.text.strip()
+
+    if not url.startswith(("http://", "https://")):
+        bot.reply_to(message, "❌ URL no válida", parse_mode="Markdown")
+        return
+
+    temp_path = None
+    try:
+        progress_msg = bot.reply_to(message, "🔎 Analizando enlace...", parse_mode="Markdown")
+        temp_path, filename = descargar_con_progreso(url, message.chat.id, progress_msg)
+        send_document_con_progreso(message.chat.id, temp_path, filename)
+        bot.delete_message(message.chat.id, progress_msg.message_id)
+        bot.reply_to(message, f"✅ Listo: `{filename}`", parse_mode='Markdown')
+
+    except Exception as e:
+        bot.edit_message_text(f"❌ Error: `{str(e)}`", message.chat.id, progress_msg.message_id, parse_mode="Markdown")
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
 
 # -------------------------
 # MAIN
 # -------------------------
-if __name__=="__main__":
-    print("🚀 File Processor Pro iniciado correctamente")
-    bot.infinity_polling(timeout=60, long_polling_timeout=30)
+
+if __name__ == "__main__":
+    print("🚀 Bot iniciado")
+    while True:
+        try:
+            bot.infinity_polling(timeout=60, long_polling_timeout=30)
+        except Exception as e:
+            print("Error crítico:", e)
+            time.sleep(10)
