@@ -10,7 +10,7 @@ from datetime import datetime
 from PIL import Image
 from telebot.types import InputFile
 
-BOT_TOKEN = "TU_TOKEN_AQUI"  # Coloca tu token real aquí
+BOT_TOKEN = "8200566220:AAH4Ld6dhXYxtdsph4s7SHyH2ficT0c3SLw"  # Coloca tu token real aquí
 bot = telebot.TeleBot(BOT_TOKEN)
 
 THUMBNAIL_URL = "https://raw.githubusercontent.com/rentcubacar40-dotcom/Bomba-/refs/heads/main/assets/foto.jpg"
