@@ -1,3 +1,4 @@
-pyTelegramBotAPI==4.12.0
-requests>=2.31.0
-Pillow==10.1.0
+pyTelegramBotAPI==4.18.1
+requests==2.32.3
+Pillow==10.3.0
+python-dotenv==1.0.1
